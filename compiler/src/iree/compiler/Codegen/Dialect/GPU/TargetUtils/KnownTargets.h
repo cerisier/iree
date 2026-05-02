@@ -38,6 +38,13 @@ struct L1CacheInfo {
   uint32_t cacheSets;
 };
 
+/// Returns the phase groups for the given LDS bank phase model, read width,
+/// and total number of threads in the wavefront. Each inner vector contains
+/// the thread IDs that access LDS simultaneously in one phase. Returns
+/// nullopt when the model is None (phase grouping unknown).
+std::optional<SmallVector<SmallVector<int64_t>>>
+getPhaseGroups(LdsBankPhaseModel model, int64_t readBytes, int64_t numThreads);
+
 // Returns the L1 cache information for the `target`.
 std::optional<L1CacheInfo> getL1CacheInfo(TargetAttr target);
 

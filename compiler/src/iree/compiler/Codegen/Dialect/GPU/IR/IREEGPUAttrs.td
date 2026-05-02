@@ -210,6 +210,12 @@ def IREEGPU_DotProductOpsAttr : EnumAttr<
   let assemblyFormat = "$value";
 }
 
+def IREEGPU_LdsBankPhaseModelAttr : EnumAttr<
+  IREEGPU_Dialect, IREEGPU_LdsBankPhaseModel, "lds_bank_phase_model"> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::GPU";
+  let assemblyFormat = "$value";
+}
+
 //===----------------------------------------------------------------------===//
 // InnerTiledSemantics
 //===----------------------------------------------------------------------===//
@@ -768,6 +774,9 @@ def IREEGPU_TargetWgpAttr : AttrDef<IREEGPU_Dialect, "TargetWgp"> {
     OptionalParameter<"DenseI64ArrayAttr">:$dma_sizes,
     // Number of banks in LDS.
     OptionalParameter<"std::optional<int32_t>">:$workgroup_memory_bank_count,
+    // LDS bank phase scheduling model for wide ds_read instructions.
+    DefaultValuedParameter<"LdsBankPhaseModelAttr",
+      "LdsBankPhaseModelAttr::get($_ctxt, LdsBankPhaseModel::None)">:$lds_bank_phase_model,
 
     // An optional extra dict
     // This field allows to inject more features/limits not supported in the

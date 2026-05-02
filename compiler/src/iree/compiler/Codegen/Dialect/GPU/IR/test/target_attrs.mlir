@@ -45,6 +45,26 @@ func.func @test_target_wgp_none() attributes {
   >
 } { return }
 
+// CHECK-LABEL: func.func @test_target_wgp_phase_model()
+func.func @test_target_wgp_phase_model() attributes {
+  // CHECK: #iree_gpu.target_wgp<
+  // CHECK-SAME: workgroup_memory_bank_count = 64,
+  // CHECK-SAME: lds_bank_phase_model = cdna4>
+  wgp = #iree_gpu.target_wgp<
+    compute = fp16|fp32|int8, storage = b16|b32,
+    subgroup = shuffle|arithmetic, dot = dp4xi8toi32,
+    mma = [<MFMA_F32_16x16x16_F16>, <MFMA_F32_32x32x8_F16>],
+    subgroup_size_choices = [64],
+    max_workgroup_sizes = [1024, 1024, 1024],
+    max_thread_count_per_workgroup = 1024,
+    max_workgroup_memory_bytes = 163840,
+    max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+    dma_sizes = [32, 128],
+    workgroup_memory_bank_count = 64,
+    lds_bank_phase_model = cdna4
+  >
+} { return }
+
 // CHECK-LABEL: func.func @test_target_chip()
 func.func @test_target_chip() attributes {
   // CHECK: #iree_gpu.target_chip<

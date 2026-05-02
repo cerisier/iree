@@ -475,6 +475,28 @@ def IREEGPU_ScaledMMAIntrinsic : IREEGPU_I32Enum<"ScaledMMAIntrinsic",
     ]>;
 
 //===----------------------------------------------------------------------===//
+// LDS bank phase models
+//
+// Describes how the LDS hardware schedules thread groups ("phases") when
+// executing wide ds_read instructions. The phase grouping determines which
+// threads access LDS simultaneously and therefore which bank collisions
+// become actual conflicts.
+
+def IREEGPU_LdsBankPhaseNone
+    : I32EnumAttrCase<"None", 0, "none">;
+def IREEGPU_LdsBankPhaseContiguous
+    : I32EnumAttrCase<"Contiguous", 1, "contiguous">;
+def IREEGPU_LdsBankPhaseCDNA4
+    : I32EnumAttrCase<"CDNA4", 2, "cdna4">;
+
+def IREEGPU_LdsBankPhaseModel : IREEGPU_I32EnumAttr<"LdsBankPhaseModel",
+    "LDS bank phase scheduling model for wide ds_read instructions", [
+      IREEGPU_LdsBankPhaseNone,
+      IREEGPU_LdsBankPhaseContiguous,
+      IREEGPU_LdsBankPhaseCDNA4
+    ]>;
+
+//===----------------------------------------------------------------------===//
 // Tiling levels
 
 def Workgroup : I32EnumAttrCase<"Workgroup", 0>;

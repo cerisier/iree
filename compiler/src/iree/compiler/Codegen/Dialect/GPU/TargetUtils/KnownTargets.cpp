@@ -59,6 +59,7 @@ struct WgpDetails {
   std::optional<int32_t> vgprSpaceBits;
   std::optional<ArrayRef<int64_t>> dmaSizes;
   std::optional<int32_t> workgroupMemoryBankCount;
+  LdsBankPhaseModel ldsBankPhaseModel = LdsBankPhaseModel::None;
 };
 
 // Chip level feature/limit details
@@ -152,7 +153,9 @@ TargetAttr createTargetAttr(const TargetDetails &details, StringRef arch,
       wgp->maxThreadSize, wgp->maxWorkgroupMemoryBytes,
       DenseI32ArrayAttr::get(context, wgp->maxWorkgroupCounts),
       wgp->maxLoadInstructionBits, wgp->simdsPerWgp, wgp->vgprSpaceBits,
-      dmaSizesAttr, wgp->workgroupMemoryBankCount, DictionaryAttr{});
+      dmaSizesAttr, wgp->workgroupMemoryBankCount,
+      LdsBankPhaseModelAttr::get(context, wgp->ldsBankPhaseModel),
+      DictionaryAttr{});
 
   TargetChipAttr targetChip;
   if (details.chip) {
@@ -269,7 +272,8 @@ const WgpDetails *getCDNA4WgpDetails() {
       /*simdsPerWgp=*/4,
       /*vgprSpaceBits=*/512 * 32,
       /*dmaSizes=*/ArrayRef<int64_t>(cdna4DMASizes),
-      /*workgroupMemoryBankCount=*/64};
+      /*workgroupMemoryBankCount=*/64,
+      /*ldsBankPhaseModel=*/LdsBankPhaseModel::CDNA4};
   return &cdna4Wgp;
 }
 
@@ -1177,6 +1181,60 @@ std::optional<TargetDetails> getAndroidProfileDetails(StringRef target) {
 //===----------------------------------------------------------------------===//
 // Query functions
 //===----------------------------------------------------------------------===//
+
+constexpr int64_t kLdsBankWidth = 4; // LDS bank width in bytes (AMD)
+
+std::optional<SmallVector<SmallVector<int64_t>>>
+getPhaseGroups(LdsBankPhaseModel model, int64_t readBytes,
+               int64_t numThreads) {
+  if (model == LdsBankPhaseModel::None) {
+    return std::nullopt;
+  }
+
+  SmallVector<SmallVector<int64_t>> phases;
+  int64_t banksPerAccess = std::max<int64_t>(1, readBytes / kLdsBankWidth);
+  int64_t threadsPerPhase = numThreads / banksPerAccess;
+  if (threadsPerPhase <= 0) {
+    threadsPerPhase = numThreads;
+  }
+
+  auto buildContiguous = [&]() {
+    int64_t numPhases = numThreads / threadsPerPhase;
+    phases.resize(numPhases);
+    for (int64_t t = 0; t < numThreads; ++t) {
+      phases[t / threadsPerPhase].push_back(t);
+    }
+  };
+
+  switch (model) {
+  case LdsBankPhaseModel::None:
+    llvm_unreachable("handled above");
+
+  case LdsBankPhaseModel::Contiguous:
+    buildContiguous();
+    break;
+
+  case LdsBankPhaseModel::CDNA4:
+    if (readBytes <= 8) {
+      buildContiguous();
+    } else {
+      // ds_read_b128 on CDNA4: 4 phases of 16 threads, non-contiguous.
+      // Phase assignment from hardware documentation / empirical measurement.
+      static const int64_t cdna4B128Phases[64] = {
+          0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0,
+          2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2,
+          1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3, 1, 1, 1, 1,
+          3, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3};
+      int64_t numPhases = 4;
+      phases.resize(numPhases);
+      for (int64_t t = 0; t < numThreads && t < 64; ++t) {
+        phases[cdna4B128Phases[t]].push_back(t);
+      }
+    }
+    break;
+  }
+  return phases;
+}
 
 std::optional<L1CacheInfo> getL1CacheInfo(TargetAttr target) {
   // TODO(kuhar): Add L1 cache query for other HIP targets.

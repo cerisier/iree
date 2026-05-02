@@ -598,10 +598,9 @@ func.func @matmul_bf16(
 
 // -----
 
-// BF16 1x1 conv with DMA. The MMA intrinsic (MFMA_F32_32x32x8_BF16) is not in
-// the tuned swizzle table, so no XOR swizzle should be applied -- only plain
-// use_global_load_dma.
-func.func @conv_bf16_no_untuned_swizzle(
+// BF16 1x1 conv with DMA. The iterative search finds an XOR swizzle for LHS
+// (which has K contiguous) but not for RHS (which is already conflict-free).
+func.func @conv_bf16_dma_swizzle(
     %arg0: tensor<16x96x64x40xbf16>,
     %arg1: tensor<40x1x1x40xbf16>) -> tensor<16x96x64x40xf32> {
   %cst = arith.constant 0.000000e+00 : f32
@@ -613,6 +612,6 @@ func.func @conv_bf16_no_untuned_swizzle(
   return %result : tensor<16x96x64x40xf32>
 }
 
-// IGEMM-DIRECT-LOAD-LABEL: func.func @conv_bf16_no_untuned_swizzle
+// IGEMM-DIRECT-LOAD-LABEL: func.func @conv_bf16_dma_swizzle
 // IGEMM-DIRECT-LOAD:       linalg.conv_2d_nhwc_fhwc {
-// IGEMM-DIRECT-LOAD-SAME:    promotion_types = [#iree_gpu.use_global_load_dma, #iree_gpu.use_global_load_dma]
+// IGEMM-DIRECT-LOAD-SAME:    promotion_types = [#iree_gpu.swizzle_operand<copy_config = #iree_gpu.use_global_load_dma, swizzle = #iree_codegen.xor_shuffle<128, 4>>, #iree_gpu.use_global_load_dma]

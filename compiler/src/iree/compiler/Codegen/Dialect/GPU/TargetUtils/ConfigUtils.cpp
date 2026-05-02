@@ -884,16 +884,16 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     // TODO(#24255): Fix untuned swizzle logic for DMA.
     if (lhsElemType.isBF16() && !transposedLhs) {
       FailureOr<Attribute> lhsSwizzleAttr = getXorShuffleAttr(
-          context, lhsAttr, target, kind, schedule->kTileSizes, kMMAOperandLhs,
-          /*skipUntunedFallback=*/true);
+          context, lhsAttr, target, kind, schedule->kTileSizes,
+          kMMAOperandLhs);
       if (succeeded(lhsSwizzleAttr)) {
         lhsAttr = *lhsSwizzleAttr;
       }
     }
     if (rhsElemType.isBF16() && transposedRhs) {
       FailureOr<Attribute> rhsSwizzleAttr = getXorShuffleAttr(
-          context, rhsAttr, target, kind, schedule->kTileSizes, kMMAOperandRhs,
-          /*skipUntunedFallback=*/true);
+          context, rhsAttr, target, kind, schedule->kTileSizes,
+          kMMAOperandRhs);
       if (succeeded(rhsSwizzleAttr)) {
         rhsAttr = *rhsSwizzleAttr;
       }
@@ -907,10 +907,12 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     // TODO(#23329): Do not swizzle shapes that have no bank conflicts.
     FailureOr<Attribute> lhsSwizzleAttr =
         getXorShuffleAttr(context, defaultConfigAttr, target, kind,
-                          schedule->kTileSizes, kMMAOperandLhs);
+                          schedule->kTileSizes, kMMAOperandLhs,
+                          /*isTransposed=*/transposedLhs);
     FailureOr<Attribute> rhsSwizzleAttr =
         getXorShuffleAttr(context, defaultConfigAttr, target, kind,
-                          schedule->kTileSizes, kMMAOperandRhs);
+                          schedule->kTileSizes, kMMAOperandRhs,
+                          /*isTransposed=*/transposedRhs);
     if (failed(lhsSwizzleAttr) || failed(rhsSwizzleAttr)) {
       promotionArray = {};
     } else {
