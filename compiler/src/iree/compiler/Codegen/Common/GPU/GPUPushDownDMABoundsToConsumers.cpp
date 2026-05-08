@@ -37,6 +37,55 @@ namespace mlir::iree_compiler {
 
 namespace {
 
+// Returns the static upper bound (in elements) for `src`'s dim `d`, if one
+// can be derived from the ranked tensor type or the immediate defining
+// `tensor.extract_slice`. For a dynamic dim whose size is a Value, looks
+// through `arith.constant` and `affine.min` to extract a constant bound.
+//
+// Used by the pushdown skip predicates: when the inner extent's UB matches
+// what the pass would otherwise pad against, both the validBytes wrap and
+// the consumer-side pad become provably unnecessary (root alignment makes
+// the wrap a no-op; AMDGPULowerCoalescedDMA's OOB clamping makes the pad a
+// no-op). See padSourceBufferDescriptorToDWORD and rewriteOneDMA below.
+static std::optional<int64_t> getInnermostStaticUpperBound(Value src,
+                                                           unsigned dim) {
+  auto srcTy = dyn_cast<RankedTensorType>(src.getType());
+  if (!srcTy) {
+    return std::nullopt;
+  }
+  int64_t s = srcTy.getDimSize(dim);
+  if (!ShapedType::isDynamic(s)) {
+    return s;
+  }
+
+  auto sl = src.getDefiningOp<tensor::ExtractSliceOp>();
+  if (!sl) {
+    return std::nullopt;
+  }
+  OpFoldResult sz = sl.getMixedSizes()[dim];
+  if (auto attr = dyn_cast<Attribute>(sz)) {
+    if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
+      return intAttr.getInt();
+    }
+    return std::nullopt;
+  }
+  Value szVal = cast<Value>(sz);
+  if (auto cst = szVal.getDefiningOp<arith::ConstantIndexOp>()) {
+    return cst.value();
+  }
+  if (auto am = szVal.getDefiningOp<affine::AffineMinOp>()) {
+    std::optional<int64_t> ub;
+    for (AffineExpr e : am.getMap().getResults()) {
+      if (auto c = dyn_cast<AffineConstantExpr>(e)) {
+        int64_t v = c.getValue();
+        ub = ub ? std::min(*ub, v) : v;
+      }
+    }
+    return ub;
+  }
+  return std::nullopt;
+}
+
 // Walk from the DMA's init operand (a forall sharedOut block argument) out
 // through the chain of nested forall shared_outs and parallel_insert_slices
 // until we reach an scf.forall whose result is read by a non-parallel_insert
@@ -54,14 +103,15 @@ namespace {
 static Value walkUpSharedOuts(Value v) {
   while (true) {
     if (auto bbarg = dyn_cast<BlockArgument>(v)) {
-      auto forall =
-          dyn_cast<scf::ForallOp>(bbarg.getOwner()->getParentOp());
-      if (!forall)
+      auto forall = dyn_cast<scf::ForallOp>(bbarg.getOwner()->getParentOp());
+      if (!forall) {
         return v;
+      }
       unsigned argIdx = bbarg.getArgNumber();
       unsigned sharedOutsStart = forall.getRank();
-      if (argIdx < sharedOutsStart)
+      if (argIdx < sharedOutsStart) {
         return v;
+      }
       v = forall.getResult(argIdx - sharedOutsStart);
       continue;
     }
@@ -70,24 +120,28 @@ static Value walkUpSharedOuts(Value v) {
     // consumed by a parallel_insert_slice inside a parent forall, follow
     // that link to the parent forall's sharedOut BlockArg.
     auto definingForall = v.getDefiningOp<scf::ForallOp>();
-    if (!definingForall)
+    if (!definingForall) {
       return v;
+    }
     auto parentForall = definingForall->getParentOfType<scf::ForallOp>();
-    if (!parentForall)
+    if (!parentForall) {
       return v;
+    }
 
     Value nextSharedOut = nullptr;
     for (Operation &op : parentForall.getTerminator().getRegion().front()) {
       auto insert = dyn_cast<tensor::ParallelInsertSliceOp>(&op);
-      if (!insert)
+      if (!insert) {
         continue;
+      }
       if (insert.getSource() == v) {
         nextSharedOut = insert.getDest();
         break;
       }
     }
-    if (!nextSharedOut)
+    if (!nextSharedOut) {
       return v;
+    }
     v = nextSharedOut;
   }
 }
@@ -103,18 +157,22 @@ static Value walkUpSharedOuts(Value v) {
 //
 // Returns failure when no rewrite is needed (already aligned, dynamic
 // element bit width, etc.). Source is mutated in place.
-static LogicalResult padSourceBufferDescriptorToDWORD(
-    IRRewriter &rewriter, IREE::GPU::CoalescedGatherDMAOp dma) {
+static LogicalResult
+padSourceBufferDescriptorToDWORD(IRRewriter &rewriter,
+                                 IREE::GPU::CoalescedGatherDMAOp dma) {
   Value src = dma.getSource();
   auto srcTy = dyn_cast<RankedTensorType>(src.getType());
-  if (!srcTy)
+  if (!srcTy) {
     return failure();
+  }
   Type elemTy = srcTy.getElementType();
-  if (!elemTy.isIntOrFloat())
+  if (!elemTy.isIntOrFloat()) {
     return failure();
+  }
   unsigned elemBits = elemTy.getIntOrFloatBitWidth();
-  if (elemBits == 0 || elemBits % 8 != 0)
+  if (elemBits == 0 || elemBits % 8 != 0) {
     return failure();
+  }
   unsigned elemBytes = elemBits / 8;
 
   // If the innermost row is statically DWORD-aligned, the partial-DWORD
@@ -136,14 +194,30 @@ static LogicalResult padSourceBufferDescriptorToDWORD(
     root = sl.getSource();
   }
   auto rootTy = dyn_cast<RankedTensorType>(root.getType());
-  if (!rootTy)
+  if (!rootTy) {
     return failure();
+  }
   unsigned rootRank = rootTy.getRank();
+
+  // Skip when the root buffer's innermost row is statically DWORD-aligned.
+  // The validBytes wrap exists to guard against the HW partial-DWORD clamp
+  // zeroing valid bytes at the buffer END; if the buffer end is naturally
+  // DWORD-aligned (which holds whenever the root's innermost row in bytes
+  // is divisible by 4 in row-major layout), no straddle is possible and the
+  // wrap is unnecessary. Catches the common "shape-dynamic but root-aligned"
+  // case (e.g. NxN f16 with N even, K-block tiling produces tensor<32x?xf16>
+  // but the root is tensor<NxNxf16> with N*2 % 4 == 0).
+  int64_t rootInnermost = rootTy.getDimSize(rootRank - 1);
+  if (!ShapedType::isDynamic(rootInnermost) &&
+      (rootInnermost * elemBytes) % 4 == 0) {
+    return failure();
+  }
 
   // If a buffer_resource_cast with valid_bytes already wraps the root, skip.
   if (auto existing = root.getDefiningOp<IREE::GPU::BufferResourceCastOp>()) {
-    if (existing.getValidBytes())
+    if (existing.getValidBytes()) {
       return failure();
+    }
   }
 
   // Compute valid_bytes = roundUp(prod(rootDim_i) * elemBytes + 4, 4).
@@ -181,8 +255,7 @@ static LogicalResult padSourceBufferDescriptorToDWORD(
   // safety margin even when naturalBytes happens to be DWORD-aligned (e.g.
   // 64x43 f16 = 5504 bytes; the last lane's straddle reads bytes 5502..5505,
   // requiring validBytes >= 5508).
-  AffineExpr rounded =
-      (prod + getAffineConstantExpr(7, ctx)).floorDiv(4) * 4;
+  AffineExpr rounded = (prod + getAffineConstantExpr(7, ctx)).floorDiv(4) * 4;
   AffineMap map = AffineMap::get(/*dimCount=*/0,
                                  /*symbolCount=*/dims.size(), rounded);
   OpFoldResult validBytesOFR =
@@ -190,10 +263,10 @@ static LogicalResult padSourceBufferDescriptorToDWORD(
   Value validBytes =
       getValueOrCreateConstantIndexOp(rewriter, loc, validBytesOFR);
 
-  auto castOp = IREE::GPU::BufferResourceCastOp::create(
-      rewriter, loc, rootTy, root,
-      /*cache_swizzle_stride=*/Value{},
-      /*valid_bytes=*/validBytes);
+  auto castOp =
+      IREE::GPU::BufferResourceCastOp::create(rewriter, loc, rootTy, root,
+                                              /*cache_swizzle_stride=*/Value{},
+                                              /*valid_bytes=*/validBytes);
 
   // Re-route uses of `root` to the cast. Keep the cast itself plus any
   // tensor.dim ops we created above (they were emitted *before* the cast and
@@ -209,28 +282,54 @@ static LogicalResult rewriteOneDMA(IRRewriter &rewriter,
                                    IREE::GPU::CoalescedGatherDMAOp dma) {
   // Only act when innermost dimension is out-of-bounds.
   std::optional<ArrayAttr> inBoundsOpt = dma.getInBounds();
-  if (!inBoundsOpt || inBoundsOpt->empty())
+  if (!inBoundsOpt || inBoundsOpt->empty()) {
     return failure();
+  }
   ArrayAttr inBounds = *inBoundsOpt;
   unsigned innermost = inBounds.size() - 1;
-  if (cast<BoolAttr>(inBounds[innermost]).getValue())
+  if (cast<BoolAttr>(inBounds[innermost]).getValue()) {
     return failure(); // innermost is in-bounds; nothing to do
+  }
 
   // Resolve the LDS tile type from the init operand.
   auto tileTy = dyn_cast<RankedTensorType>(dma.getInit().getType());
-  if (!tileTy)
+  if (!tileTy) {
     return failure();
+  }
   unsigned rank = tileTy.getRank();
   int64_t innerTileSize = tileTy.getDimSize(innermost);
-  if (ShapedType::isDynamic(innerTileSize))
+  if (ShapedType::isDynamic(innerTileSize)) {
     return failure(); // shouldn't occur; bail defensively
+  }
+
+  // Skip when the source's innermost extent has a static upper bound equal
+  // to the LDS inner tile size. Two cases:
+  //   - Full-tile workgroups: the runtime extent equals innerTileSize, so
+  //     the entire LDS tile is filled by valid data. The pad is a no-op.
+  //   - Boundary workgroups (extent < UB): lanes assigned to OOB columns
+  //     are clamped past the root buffer's end by
+  //     AMDGPULowerCoalescedDMAToGatherLDS::applyOOBClamping; the HW
+  //     fat_raw_buffer descriptor returns 0 for those reads, which the DMA
+  //     writes to the LDS destination through the same swizzle the matmul
+  //     reads through. The matmul then sees zeros in OOB columns —
+  //     identical to what the consumer pad would have written. K-reduction
+  //     contributions are zero (no pollution); N-OOB outputs are discarded
+  //     by the downstream output extract_slice.
+  // Removing the pad here avoids the masked-vector → tensor.empty alloca
+  // round-trip emitted by vectorizeAsTensorPadOp.
+  if (auto ub = getInnermostStaticUpperBound(dma.getSource(), innermost)) {
+    if (*ub == innerTileSize) {
+      return failure();
+    }
+  }
 
   // Find the outermost forall result visible to consumers.
   Value outerResult = walkUpSharedOuts(dma.getInit());
   auto outerForall =
       dyn_cast_or_null<scf::ForallOp>(outerResult.getDefiningOp());
-  if (!outerForall)
+  if (!outerForall) {
     return failure();
+  }
 
   // Insert after the outermost forall.
   rewriter.setInsertionPointAfter(outerForall);
@@ -239,18 +338,21 @@ static LogicalResult rewriteOneDMA(IRRewriter &rewriter,
   // tensor.dim of the DMA source for the innermost dimension.
   Value src = dma.getSource();
   Value innerExtent = tensor::DimOp::create(rewriter, loc, src, innermost);
-  Value innerTileV = arith::ConstantIndexOp::create(rewriter, loc, innerTileSize);
-  Value padAmount = arith::SubIOp::create(rewriter, loc, innerTileV, innerExtent);
+  Value innerTileV =
+      arith::ConstantIndexOp::create(rewriter, loc, innerTileSize);
+  Value padAmount =
+      arith::SubIOp::create(rewriter, loc, innerTileV, innerExtent);
 
   // tensor.extract_slice: cut the valid columns out of the LDS tile.
   SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
   SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
   SmallVector<OpFoldResult> validSizes;
   for (unsigned d = 0; d < rank; ++d) {
-    if (d == innermost)
+    if (d == innermost) {
       validSizes.push_back(OpFoldResult(innerExtent));
-    else
+    } else {
       validSizes.push_back(rewriter.getIndexAttr(tileTy.getDimSize(d)));
+    }
   }
   Value valid = tensor::ExtractSliceOp::create(rewriter, loc, outerResult,
                                                offsets, validSizes, strides);
@@ -262,23 +364,25 @@ static LogicalResult rewriteOneDMA(IRRewriter &rewriter,
 
   Type elemTy = tileTy.getElementType();
   TypedAttr zeroAttr = rewriter.getZeroAttr(elemTy);
-  if (!zeroAttr)
+  if (!zeroAttr) {
     return failure();
+  }
   Value padCst = arith::ConstantOp::create(rewriter, loc, zeroAttr);
 
   auto padOp = tensor::PadOp::create(rewriter, loc, tileTy, valid, lowPad,
                                      highPad, /*nofold=*/false);
   Block *body = rewriter.createBlock(&padOp.getBodyRegion());
-  for (unsigned i = 0; i < rank; ++i)
+  for (unsigned i = 0; i < rank; ++i) {
     body->addArgument(rewriter.getIndexType(), loc);
+  }
   rewriter.setInsertionPointToStart(body);
   tensor::YieldOp::create(rewriter, loc, padCst);
   rewriter.setInsertionPointAfter(padOp);
 
   // Replace all uses of the forall result with the re-padded tensor, except
   // for the extract_slice we just created which must read the original.
-  outerResult.replaceAllUsesExcept(padOp.getResult(),
-                                   valid.getDefiningOp<tensor::ExtractSliceOp>());
+  outerResult.replaceAllUsesExcept(
+      padOp.getResult(), valid.getDefiningOp<tensor::ExtractSliceOp>());
   return success();
 }
 
