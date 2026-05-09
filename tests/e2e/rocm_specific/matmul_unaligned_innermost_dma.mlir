@@ -1,33 +1,48 @@
-// E2E test: fully-unaligned matmul (M, N, K all not multiples of the
-// workgroup tile=64), exercising the coalesced_gather_dma straddle case
-// that GPUPushDownDMABoundsToConsumers + the buffer_resource_cast
-// validBytes hack address.
+// E2E coverage for GPUPushDownDMABoundsToConsumers + buffer_resource_cast
+// validBytes hack on coalesced_gather_dma sources whose innermost row is
+// not statically DWORD-aligned, plus the runtime-aligned-but-dynamic case
+// where both wrap and consumer-pad must be skipped.
 //
-//   131x131x131 : 3x3=9 workgroups, 3 K-blocks. Tail K-block has straddle.
-//                 Both LHS and RHS have non-DWORD-aligned innermost rows.
+// All-1.0 inputs => output cell = K.
 //
-// All-1.0 inputs → output = K (= 131.0 here).
-//
-// Compile + run (assuming a build at /home/xunli/iree-build):
-//
-//   iree-compile \
-//     --iree-hal-target-device=hip --iree-rocm-target=gfx950 \
-//     --iree-llvmgpu-use-direct-load \
-//     matmul_unaligned_innermost_dma.mlir \
-//     -o /tmp/matmul_unaligned.vmfb
-//
-//   iree-run-module --device=hip \
-//     --module=/tmp/matmul_unaligned.vmfb \
-//     --function=matmul_f16_131x131x131 \
-//     --input='131x131xf16=1.0' --input='131x131xf16=1.0' \
-//     --expected_output='131x131xf32=131.0'
+// Two cases:
+//   matmul_f16_padded_64x43x64   : K=43 (86 B/row, NOT DWORD-aligned).
+//                                  Producer-side validBytes wrap + consumer
+//                                  pad both fire.
+//   matmul_f16_dynamic_80x80x80  : All dims = 80 (160 B/row, DWORD-aligned)
+//                                  but non-tile-divisible, so codegen
+//                                  produces a tile-induced dynamic inner
+//                                  slice with affine.min UB equal to the
+//                                  K-tile. Both skips in
+//                                  GPUPushDownDMABoundsToConsumers must
+//                                  fire (no validBytes wrap, no pad).
 
-!acc131_t = tensor<131x131xf32>
-func.func @matmul_f16_131x131x131(%lhs: tensor<131x131xf16>, %rhs: tensor<131x131xf16>) -> !acc131_t {
-  %zero  = arith.constant 0.0 : f32
-  %empty = tensor.empty() : !acc131_t
-  %fill  = linalg.fill ins(%zero : f32) outs(%empty : !acc131_t) -> !acc131_t
-  %res   = linalg.matmul ins(%lhs, %rhs : tensor<131x131xf16>, tensor<131x131xf16>)
-                         outs(%fill : !acc131_t) -> !acc131_t
-  return %res : !acc131_t
+func.func @matmul_f16_padded_64x43x64() {
+  %lhs = util.unfoldable_constant dense<1.0> : tensor<64x43xf16>
+  %rhs = util.unfoldable_constant dense<1.0> : tensor<43x64xf16>
+  %zero = arith.constant 0.0 : f32
+  %empty = tensor.empty() : tensor<64x64xf32>
+  %fill = linalg.fill ins(%zero : f32) outs(%empty : tensor<64x64xf32>)
+      -> tensor<64x64xf32>
+  %res = linalg.matmul
+      ins(%lhs, %rhs : tensor<64x43xf16>, tensor<43x64xf16>)
+      outs(%fill : tensor<64x64xf32>) -> tensor<64x64xf32>
+  check.expect_almost_eq_const(%res, dense<43.0> : tensor<64x64xf32>)
+      : tensor<64x64xf32>
+  return
+}
+
+func.func @matmul_f16_dynamic_80x80x80() {
+  %lhs = util.unfoldable_constant dense<1.0> : tensor<80x80xf16>
+  %rhs = util.unfoldable_constant dense<1.0> : tensor<80x80xf16>
+  %zero = arith.constant 0.0 : f32
+  %empty = tensor.empty() : tensor<80x80xf32>
+  %fill = linalg.fill ins(%zero : f32) outs(%empty : tensor<80x80xf32>)
+      -> tensor<80x80xf32>
+  %res = linalg.matmul
+      ins(%lhs, %rhs : tensor<80x80xf16>, tensor<80x80xf16>)
+      outs(%fill : tensor<80x80xf32>) -> tensor<80x80xf32>
+  check.expect_almost_eq_const(%res, dense<80.0> : tensor<80x80xf32>)
+      : tensor<80x80xf32>
+  return
 }

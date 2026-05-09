@@ -27,3 +27,34 @@ if(IREE_ROCM_TEST_TARGET_CHIP MATCHES "^gfx1[12]")
       "requires-gpu-rdna3"
   )
 endif()
+
+# Coalesced gather DMA on non-DWORD-aligned innermost rows + runtime-aligned
+# dynamic inner extent (covers GPUPushDownDMABoundsToConsumers and the
+# buffer_resource_cast validBytes hack).
+if(IREE_ROCM_TEST_TARGET_CHIP MATCHES "^gfx94" OR
+   IREE_ROCM_TEST_TARGET_CHIP MATCHES "^gfx95")
+  if(IREE_ROCM_TEST_TARGET_CHIP MATCHES "^gfx94")
+    set(_DMA_CDNA_ARCH "cdna3")
+  else()
+    set(_DMA_CDNA_ARCH "cdna4")
+  endif()
+  iree_check_single_backend_test_suite(
+    NAME
+      check_rocm_hip_matmul_unaligned_innermost_dma
+    SRCS
+      "matmul_unaligned_innermost_dma.mlir"
+    TARGET_BACKEND
+      "rocm"
+    DRIVER
+      "hip"
+    COMPILER_FLAGS
+      "--iree-rocm-target=${IREE_ROCM_TEST_TARGET_CHIP}"
+      "--iree-llvmgpu-use-direct-load"
+    LABELS
+      "noasan"
+      "nomsan"
+      "notsan"
+      "noubsan"
+      "requires-gpu-${_DMA_CDNA_ARCH}"
+  )
+endif()
