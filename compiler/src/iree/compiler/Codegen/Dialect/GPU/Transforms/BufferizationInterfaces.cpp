@@ -609,11 +609,9 @@ struct BufferResourceCastOpBufferizationInterface
     auto bufferMemrefType = cast<MemRefType>(buffer.value().getType());
     bool isStorageBuffer = hasStorageBufferMemSpace(bufferMemrefType);
     bool isFatRawBuffer = false;
-    if (auto fatAddr =
-            dyn_cast_if_present<amdgpu::AddressSpaceAttr>(
-                bufferMemrefType.getMemorySpace())) {
-      isFatRawBuffer =
-          fatAddr.getValue() == amdgpu::AddressSpace::FatRawBuffer;
+    if (auto fatAddr = dyn_cast_if_present<amdgpu::AddressSpaceAttr>(
+            bufferMemrefType.getMemorySpace())) {
+      isFatRawBuffer = fatAddr.getValue() == amdgpu::AddressSpace::FatRawBuffer;
     }
     // Only emit a fat_raw_buffer_cast when:
     //   - input is in storage_buffer space (the original case), OR
