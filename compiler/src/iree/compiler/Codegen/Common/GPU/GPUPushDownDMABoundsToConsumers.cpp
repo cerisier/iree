@@ -313,8 +313,16 @@ static LogicalResult rewriteOneDMA(IRRewriter &rewriter,
   //     by the downstream output extract_slice.
   // Removing the pad here avoids the masked-vector → tensor.empty alloca
   // round-trip emitted by vectorizeAsTensorPadOp.
+  //
+  // Tag the DMA with a discardable `iree_gpu.oob_zero_fill_required` attr
+  // that downstream lowerings (AMDGPULowerCoalescedDMAToGatherLDS) must
+  // honor. If a non-fat_raw_buffer lowering path is selected for this DMA,
+  // OOB lanes would not be zeroed and the consumer that we just relieved of
+  // its pad would observe garbage. The attr makes that contract explicit so
+  // mislowering errors instead of silently corrupting.
   if (auto ub = getInnermostStaticUpperBound(dma.getSource(), innermost)) {
     if (*ub == innerTileSize) {
+      dma->setAttr("iree_gpu.oob_zero_fill_required", rewriter.getUnitAttr());
       return failure();
     }
   }

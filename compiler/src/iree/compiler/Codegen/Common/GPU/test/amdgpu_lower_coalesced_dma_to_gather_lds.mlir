@@ -1972,3 +1972,41 @@ func.func @lower_dma_swizzle_combined_base_and_access_width(
   } {mapping = [#iree_gpu.lane_id<0>]}
   return
 }
+
+// -----
+
+// Test: oob_zero_fill_required attr on a non-fat_raw_buffer source must
+// error out instead of silently lowering with no OOB clamp. The contract
+// is set by GPUPushDownDMABoundsToConsumers when its consumer-side pad
+// has been elided; if that contract isn't honored downstream, the
+// consumer would observe garbage in the OOB columns.
+
+#executable_target_oob_check = #hal.executable.target<"rocm",
+  "rocm-hsaco-fb", {iree_codegen.target_info = #iree_gpu.target<
+  arch = "gfx950", features = "", wgp = <
+    compute = fp32, storage = b32, subgroup = none, dot = none, mma = [], subgroup_size_choices = [32, 32],
+    max_workgroup_sizes = [1024, 1024, 1024],
+    max_thread_count_per_workgroup = 1024,
+    max_workgroup_memory_bytes = 65536,
+    max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+    max_load_instruction_bits = 128, simds_per_wgp = 4,
+    vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
+
+#translation_oob_check = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
+
+func.func @oob_zero_fill_required_on_non_fat_raw(
+    %source: memref<2x128xf32>,
+    %dest: memref<4x128xf32, #gpu.address_space<workgroup>>)
+  attributes {
+    hal.executable.target = #executable_target_oob_check,
+    translation_info = #translation_oob_check} {
+  scf.forall (%arg6) in (32) {
+    // expected-error @+1 {{carries 'iree_gpu.oob_zero_fill_required'}}
+    iree_gpu.coalesced_gather_dma %source into %dest lane(%arg6)
+        in_bounds [false, true]
+        {iree_gpu.oob_zero_fill_required} :
+      memref<2x128xf32>,
+      memref<4x128xf32, #gpu.address_space<workgroup>>, index
+  } {mapping = [#gpu.thread<linear_dim_0>]}
+  return
+}

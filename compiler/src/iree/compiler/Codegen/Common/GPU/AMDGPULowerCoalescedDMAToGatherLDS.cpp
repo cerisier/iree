@@ -215,6 +215,32 @@ static void applyOOBClamping(OpBuilder &builder, Location loc, Value source,
       arith::SelectOp::create(builder, loc, anyOOB, oobOuterIdx, srcIndices[0]);
 }
 
+/// Enforce the contract carried by the discardable
+/// `iree_gpu.oob_zero_fill_required` attribute. The attribute is set by
+/// GPUPushDownDMABoundsToConsumers when its consumer-side tensor.pad has been
+/// elided on the assumption that this lowering will write zero to the LDS
+/// destination for any OOB lane. That guarantee only holds when the source
+/// memref is in the AMD fat_raw_buffer address space (so the HW partial-OOB
+/// clamp returns 0 for OOB byte offsets and applyOOBClamping can force the
+/// outer index past the buffer end). When that is not the case the consumer
+/// would see uninitialized LDS columns, so refuse to lower with a hard
+/// diagnostic instead of silently producing garbage.
+static LogicalResult
+verifyOOBZeroFillContract(IREE::GPU::CoalescedGatherDMAOp dmaOp) {
+  if (!dmaOp->hasAttr("iree_gpu.oob_zero_fill_required")) {
+    return success();
+  }
+  auto sourceType = dyn_cast<MemRefType>(dmaOp.getSource().getType());
+  if (sourceType && hasAMDGPUFatRawBufferAddressSpace(sourceType)) {
+    return success();
+  }
+  return dmaOp->emitOpError()
+         << "carries 'iree_gpu.oob_zero_fill_required' (consumer pad was "
+            "elided by GPUPushDownDMABoundsToConsumers) but the source did "
+            "not lower to a fat_raw_buffer memref; OOB lanes will not be "
+            "zeroed and the consumer would observe garbage";
+}
+
 /// Trace a memref value through view-like ops to find a SwizzleHintOp.
 /// Returns the swizzle attribute if it is an XOR swizzle (which is
 /// self-inverse), std::nullopt otherwise.
@@ -795,6 +821,25 @@ struct AMDGPULowerCoalescedDMAToGatherLDSPass final
       LDBG() << "Missing GPU target attribute, pass will fail";
       // Don't fail if no target attribute - just skip the pass.
       return;
+    }
+
+    // Enforce the OOB-zero-fill contract carried by the discardable
+    // `iree_gpu.oob_zero_fill_required` attribute *before* the rewrite
+    // patterns run. The contract is set by GPUPushDownDMABoundsToConsumers
+    // when its consumer-side pad has been elided; if the source did not
+    // lower to a fat_raw_buffer memref, OOB lanes will not be zeroed and
+    // the consumer would see garbage. Erroring here (rather than from
+    // inside a pattern's matchAndRewrite) avoids double-diagnosing the
+    // same op when both the fast and fallback patterns reject it.
+    WalkResult contractResult =
+        funcOp.walk([&](IREE::GPU::CoalescedGatherDMAOp dmaOp) {
+          if (failed(verifyOOBZeroFillContract(dmaOp))) {
+            return WalkResult::interrupt();
+          }
+          return WalkResult::advance();
+        });
+    if (contractResult.wasInterrupted()) {
+      return signalPassFailure();
     }
 
     // dma_sizes is optional - if not specified, skip the size validation.
