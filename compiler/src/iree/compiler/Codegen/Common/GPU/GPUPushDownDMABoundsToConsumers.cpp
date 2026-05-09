@@ -29,6 +29,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/ValueBoundsOpInterface.h"
 
 namespace mlir::iree_compiler {
 
@@ -38,9 +39,12 @@ namespace mlir::iree_compiler {
 namespace {
 
 // Returns the static upper bound (in elements) for `src`'s dim `d`, if one
-// can be derived from the ranked tensor type or the immediate defining
-// `tensor.extract_slice`. For a dynamic dim whose size is a Value, looks
-// through `arith.constant` and `affine.min` to extract a constant bound.
+// can be derived from the ranked tensor type or the SSA chain that produces
+// the value. Static dims short-circuit; dynamic dims defer to
+// ValueBoundsConstraintSet::computeConstantBound, which traverses
+// tensor.extract_slice, tensor.cast, affine.{min,max,apply}, scf.if, and any
+// other op that implements ValueBoundsOpInterface, accumulating constraints
+// across the full producer chain (not just the immediate defining op).
 //
 // Used by the pushdown skip predicates: when the inner extent's UB matches
 // what the pass would otherwise pad against, both the validBytes wrap and
@@ -57,33 +61,25 @@ static std::optional<int64_t> getInnermostStaticUpperBound(Value src,
   if (!ShapedType::isDynamic(s)) {
     return s;
   }
-
-  auto sl = src.getDefiningOp<tensor::ExtractSliceOp>();
-  if (!sl) {
+  // iree_gpu.buffer_resource_cast preserves shape (AllTypesMatch on input and
+  // result) but does not implement ValueBoundsOpInterface, so the underlying
+  // bound would not be reachable through it. Peel any chain of these casts
+  // before delegating to the value-bounds analysis. This matters when Skip #1
+  // has already wrapped the source with a validBytes cast: the DMA's source
+  // is then the cast's result, but the static bound still lives further up
+  // the chain (e.g. through tensor.cast or tensor.extract_slice).
+  while (auto brc = src.getDefiningOp<IREE::GPU::BufferResourceCastOp>()) {
+    src = brc.getInput();
+  }
+  ValueBoundsOptions options;
+  options.closedUB = true;
+  FailureOr<int64_t> ub = ValueBoundsConstraintSet::computeConstantBound(
+      presburger::BoundType::UB, {src, static_cast<int64_t>(dim)},
+      /*stopCondition=*/nullptr, options);
+  if (failed(ub)) {
     return std::nullopt;
   }
-  OpFoldResult sz = sl.getMixedSizes()[dim];
-  if (auto attr = dyn_cast<Attribute>(sz)) {
-    if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
-      return intAttr.getInt();
-    }
-    return std::nullopt;
-  }
-  Value szVal = cast<Value>(sz);
-  if (auto cst = szVal.getDefiningOp<arith::ConstantIndexOp>()) {
-    return cst.value();
-  }
-  if (auto am = szVal.getDefiningOp<affine::AffineMinOp>()) {
-    std::optional<int64_t> ub;
-    for (AffineExpr e : am.getMap().getResults()) {
-      if (auto c = dyn_cast<AffineConstantExpr>(e)) {
-        int64_t v = c.getValue();
-        ub = ub ? std::min(*ub, v) : v;
-      }
-    }
-    return ub;
-  }
-  return std::nullopt;
+  return *ub;
 }
 
 // Walk from the DMA's init operand (a forall sharedOut block argument) out

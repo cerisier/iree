@@ -331,3 +331,46 @@ func.func @consumer_pad_skipped_even_when_root_misaligned(
 // CHECK-LABEL: func.func @consumer_pad_skipped_even_when_root_misaligned
 // CHECK:       iree_gpu.buffer_resource_cast %arg0 validBytes
 // CHECK-NOT:   tensor.pad
+
+// -----
+
+// Test 10: dynamic-shape source whose inner extent's static UB is reachable
+// only through a multi-op SSA chain (tensor.extract_slice -> tensor.cast).
+// The old shallow walk (immediate defining op == tensor.extract_slice) would
+// give up here because the DMA source's defining op is a tensor.cast, not an
+// extract_slice. ValueBoundsConstraintSet traverses the cast back to the
+// extract_slice's static inner size (128) so Skip #2 still elides the
+// consumer pad.
+//
+// Root is intentionally DWORD-misaligned (4001 odd) so Skip #1 stays out of
+// the picture; this test is exclusively about generalized UB extraction.
+
+func.func @inner_ub_through_tensor_cast(
+    %root : tensor<4000x4001xf16>,
+    %init : tensor<32x128xf16>,
+    %off  : index,
+    %lane : index) -> tensor<32x128xf16> {
+  %c0 = arith.constant 0 : index
+  %static = tensor.extract_slice %root[%c0, %off] [32, 128] [1, 1]
+      : tensor<4000x4001xf16> to tensor<32x128xf16>
+  %src = tensor.cast %static : tensor<32x128xf16> to tensor<32x?xf16>
+  %filled = scf.forall (%w) in (1) shared_outs(%outer = %init)
+      -> tensor<32x128xf16> {
+    %inner = scf.forall (%l) in (32) shared_outs(%inn = %outer)
+        -> tensor<32x128xf16> {
+      scf.forall.in_parallel {
+        iree_gpu.coalesced_gather_dma %src into %inn lane(%l)
+            in_bounds [true, false]
+          : tensor<32x?xf16>, tensor<32x128xf16>, index
+      }
+    } {mapping = [#gpu.thread<linear_dim_0>]}
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %inner into %outer [0, 0] [32, 128] [1, 1]
+        : tensor<32x128xf16> into tensor<32x128xf16>
+    }
+  } {mapping = [#gpu.warp<linear_dim_0>]}
+  return %filled : tensor<32x128xf16>
+}
+// CHECK-LABEL: func.func @inner_ub_through_tensor_cast
+// Skip #2 (UB = 128 reached through tensor.cast) drops the consumer pad.
+// CHECK-NOT:   tensor.pad
