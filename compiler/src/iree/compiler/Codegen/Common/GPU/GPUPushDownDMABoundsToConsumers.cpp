@@ -27,6 +27,8 @@
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
@@ -51,6 +53,42 @@ namespace {
 // the consumer-side pad become provably unnecessary (root alignment makes
 // the wrap a no-op; AMDGPULowerCoalescedDMA's OOB clamping makes the pad a
 // no-op). See padSourceBufferDescriptorToDWORD and rewriteOneDMA below.
+// Peek a constant upper bound through a small set of ops that
+// ValueBoundsOpInterface does not currently model in upstream MLIR but that
+// are routinely produced by IREE codegen for K-block boundary computations
+// (arith.minsi/minui with at least one constant operand: the result is
+// trivially bounded by that constant, regardless of the other operand).
+// Used as a fallback when ValueBoundsConstraintSet returns failure.
+static std::optional<int64_t> peekConstantOperandUB(Value v) {
+  if (!v) {
+    return std::nullopt;
+  }
+  auto matchConst = [](Value x) -> std::optional<int64_t> {
+    IntegerAttr a;
+    if (matchPattern(x, m_Constant(&a))) {
+      return a.getInt();
+    }
+    return std::nullopt;
+  };
+  if (auto m = v.getDefiningOp<arith::MinSIOp>()) {
+    if (auto c = matchConst(m.getRhs())) {
+      return c;
+    }
+    if (auto c = matchConst(m.getLhs())) {
+      return c;
+    }
+  }
+  if (auto m = v.getDefiningOp<arith::MinUIOp>()) {
+    if (auto c = matchConst(m.getRhs())) {
+      return c;
+    }
+    if (auto c = matchConst(m.getLhs())) {
+      return c;
+    }
+  }
+  return std::nullopt;
+}
+
 static std::optional<int64_t> getInnermostStaticUpperBound(Value src,
                                                            unsigned dim) {
   auto srcTy = dyn_cast<RankedTensorType>(src.getType());
@@ -76,10 +114,26 @@ static std::optional<int64_t> getInnermostStaticUpperBound(Value src,
   FailureOr<int64_t> ub = ValueBoundsConstraintSet::computeConstantBound(
       presburger::BoundType::UB, {src, static_cast<int64_t>(dim)},
       /*stopCondition=*/nullptr, options);
-  if (failed(ub)) {
-    return std::nullopt;
+  if (succeeded(ub)) {
+    return *ub;
   }
-  return *ub;
+  // ValueBounds failed (the producer chain has at least one op with no
+  // ValueBoundsOpInterface impl, e.g. arith.minsi). Try a shallow fallback:
+  // when the source is `tensor.extract_slice ... [..., size]` and `size`
+  // is a constant operand of an arith.min{si,ui}, we can read the bound
+  // directly from that constant operand. This covers the canonical
+  // K-block boundary pattern emitted by tile-and-fuse.
+  if (auto sl = src.getDefiningOp<tensor::ExtractSliceOp>()) {
+    OpFoldResult sz = sl.getMixedSizes()[dim];
+    if (auto attr = dyn_cast<Attribute>(sz)) {
+      if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
+        return intAttr.getInt();
+      }
+    } else if (auto bound = peekConstantOperandUB(cast<Value>(sz))) {
+      return bound;
+    }
+  }
+  return std::nullopt;
 }
 
 // Walk from the DMA's init operand (a forall sharedOut block argument) out
@@ -287,20 +341,42 @@ static LogicalResult rewriteOneDMA(IRRewriter &rewriter,
     return failure(); // innermost is in-bounds; nothing to do
   }
 
-  // Resolve the LDS tile type from the init operand.
+  // Resolve the LDS tile type from the init operand. This is the
+  // per-DMA tile shape (e.g. one warp's slice of the workgroup tile). It is
+  // used only to obtain the rank and to validate that the innermost extent
+  // is statically known on the DMA side; the slice + pad we insert operates
+  // on the *outer* forall result and must be sized using that tensor's
+  // shape, not this one (the two differ along the dimensions that the warp
+  // / thread foralls have already partitioned).
   auto tileTy = dyn_cast<RankedTensorType>(dma.getInit().getType());
   if (!tileTy) {
     return failure();
   }
   unsigned rank = tileTy.getRank();
-  int64_t innerTileSize = tileTy.getDimSize(innermost);
-  if (ShapedType::isDynamic(innerTileSize)) {
+  if (ShapedType::isDynamic(tileTy.getDimSize(innermost))) {
     return failure(); // shouldn't occur; bail defensively
   }
 
+  // Find the outermost forall result visible to consumers.
+  Value outerResult = walkUpSharedOuts(dma.getInit());
+  auto outerForall =
+      dyn_cast_or_null<scf::ForallOp>(outerResult.getDefiningOp());
+  if (!outerForall) {
+    return failure();
+  }
+  auto outerTy = dyn_cast<RankedTensorType>(outerResult.getType());
+  if (!outerTy || outerTy.getRank() != rank) {
+    return failure();
+  }
+  int64_t outerInnerSize = outerTy.getDimSize(innermost);
+  if (ShapedType::isDynamic(outerInnerSize)) {
+    return failure();
+  }
+
   // Skip when the source's innermost extent has a static upper bound equal
-  // to the LDS inner tile size. Two cases:
-  //   - Full-tile workgroups: the runtime extent equals innerTileSize, so
+  // to the outer forall result's inner extent (i.e. the size we would pad
+  // back to). Two cases:
+  //   - Full-tile workgroups: the runtime extent equals outerInnerSize, so
   //     the entire LDS tile is filled by valid data. The pad is a no-op.
   //   - Boundary workgroups (extent < UB): lanes assigned to OOB columns
   //     are clamped past the root buffer's end by
@@ -321,17 +397,24 @@ static LogicalResult rewriteOneDMA(IRRewriter &rewriter,
   // its pad would observe garbage. The attr makes that contract explicit so
   // mislowering errors instead of silently corrupting.
   if (auto ub = getInnermostStaticUpperBound(dma.getSource(), innermost)) {
-    if (*ub == innerTileSize) {
+    if (*ub == outerInnerSize) {
       dma->setAttr("iree_gpu.oob_zero_fill_required", rewriter.getUnitAttr());
       return failure();
     }
   }
 
-  // Find the outermost forall result visible to consumers.
-  Value outerResult = walkUpSharedOuts(dma.getInit());
-  auto outerForall =
-      dyn_cast_or_null<scf::ForallOp>(outerResult.getDefiningOp());
-  if (!outerForall) {
+  // The slice + pad we emit lives outside outerForall and reads the DMA
+  // source via tensor.dim. That only verifies if the source dominates
+  // outerForall. For DMAs whose source is itself defined inside outerForall
+  // (e.g. an extract_slice that depends on a warp/lane induction variable),
+  // the dynamic extent simply cannot be hoisted to the outer scope without
+  // changing semantics, and the consumer pad must be skipped. Bailing here
+  // is safe: the DMA's in_bounds=false still routes through HW OOB clamping
+  // at lowering time, so the worst case is a missed optimization, not
+  // incorrect IR.
+  Value src = dma.getSource();
+  mlir::DominanceInfo dom;
+  if (!dom.properlyDominates(src, outerForall)) {
     return failure();
   }
 
@@ -340,14 +423,15 @@ static LogicalResult rewriteOneDMA(IRRewriter &rewriter,
   Location loc = dma.getLoc();
 
   // tensor.dim of the DMA source for the innermost dimension.
-  Value src = dma.getSource();
   Value innerExtent = tensor::DimOp::create(rewriter, loc, src, innermost);
-  Value innerTileV =
-      arith::ConstantIndexOp::create(rewriter, loc, innerTileSize);
+  Value outerInnerV =
+      arith::ConstantIndexOp::create(rewriter, loc, outerInnerSize);
   Value padAmount =
-      arith::SubIOp::create(rewriter, loc, innerTileV, innerExtent);
+      arith::SubIOp::create(rewriter, loc, outerInnerV, innerExtent);
 
-  // tensor.extract_slice: cut the valid columns out of the LDS tile.
+  // tensor.extract_slice: cut the valid columns out of the outer forall's
+  // result. Outer dims use the outer tile's static sizes (the workgroup
+  // tile shape); the innermost dim takes the dynamic source extent.
   SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
   SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
   SmallVector<OpFoldResult> validSizes;
@@ -355,25 +439,32 @@ static LogicalResult rewriteOneDMA(IRRewriter &rewriter,
     if (d == innermost) {
       validSizes.push_back(OpFoldResult(innerExtent));
     } else {
-      validSizes.push_back(rewriter.getIndexAttr(tileTy.getDimSize(d)));
+      int64_t outerDim = outerTy.getDimSize(d);
+      if (ShapedType::isDynamic(outerDim)) {
+        return failure();
+      }
+      validSizes.push_back(rewriter.getIndexAttr(outerDim));
     }
   }
   Value valid = tensor::ExtractSliceOp::create(rewriter, loc, outerResult,
                                                offsets, validSizes, strides);
 
-  // tensor.pad: re-expand to the full tile shape with zero padding.
+  // tensor.pad: re-expand to the outer forall result's full shape with zero
+  // padding. The replaced uses are downstream of the outer forall, so the
+  // padded result must match outerTy exactly (otherwise the consumer
+  // (linalg.matmul, linalg.pack, ...) sees the wrong shape).
   SmallVector<OpFoldResult> lowPad(rank, rewriter.getIndexAttr(0));
   SmallVector<OpFoldResult> highPad(rank, rewriter.getIndexAttr(0));
   highPad[innermost] = OpFoldResult(padAmount);
 
-  Type elemTy = tileTy.getElementType();
+  Type elemTy = outerTy.getElementType();
   TypedAttr zeroAttr = rewriter.getZeroAttr(elemTy);
   if (!zeroAttr) {
     return failure();
   }
   Value padCst = arith::ConstantOp::create(rewriter, loc, zeroAttr);
 
-  auto padOp = tensor::PadOp::create(rewriter, loc, tileTy, valid, lowPad,
+  auto padOp = tensor::PadOp::create(rewriter, loc, outerTy, valid, lowPad,
                                      highPad, /*nofold=*/false);
   Block *body = rewriter.createBlock(&padOp.getBodyRegion());
   for (unsigned i = 0; i < rank; ++i) {

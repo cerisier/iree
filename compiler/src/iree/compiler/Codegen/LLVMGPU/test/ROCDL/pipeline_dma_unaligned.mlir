@@ -64,9 +64,10 @@ hal.executable public @matmul_64x43x64 {
       // CHECK-DAG: amdgpu.fat_raw_buffer_cast %{{.+}} resetOffset : memref<43x64xf16, #hal.descriptor_type<storage_buffer>> to memref<43x64xf16, #amdgpu.address_space<fat_raw_buffer>>
       //
       // Both LHS and RHS bindings are loaded via gather_to_lds against their
-      // fat_raw_buffer descriptors.
-      // CHECK: amdgpu.gather_to_lds {{.*}} memref<64x43xf16, #amdgpu.address_space<fat_raw_buffer>>
-      // CHECK: amdgpu.gather_to_lds {{.*}} memref<43x64xf16, #amdgpu.address_space<fat_raw_buffer>>
+      // fat_raw_buffer descriptors. Tile-and-fuse may insert memref.subview
+      // ops in between, so the gather_to_lds source can be either the cast
+      // itself or a strided subview into the fat_raw_buffer space.
+      // CHECK-COUNT-2: amdgpu.gather_to_lds {{.*}} #amdgpu.address_space<fat_raw_buffer>>
       func.func @matmul_64x43x64() {
         %c0 = arith.constant 0 : index
         %cst = arith.constant 0.0 : f32
@@ -151,9 +152,9 @@ hal.executable public @matmul_80x80x80 {
       // CHECK-NOT: amdgpu.fat_raw_buffer_cast %{{.+}} validBytes
       //
       // Both bindings still reach gather_to_lds against their fat_raw_buffer
-      // descriptors.
-      // CHECK: amdgpu.gather_to_lds {{.*}} memref<80x80xf16, #amdgpu.address_space<fat_raw_buffer>>
-      // CHECK: amdgpu.gather_to_lds {{.*}} memref<80x80xf16, #amdgpu.address_space<fat_raw_buffer>>
+      // descriptors. Subviews into the fat_raw_buffer space are fine; we
+      // only assert the destination address space here.
+      // CHECK-COUNT-2: amdgpu.gather_to_lds {{.*}} #amdgpu.address_space<fat_raw_buffer>>
       func.func @matmul_80x80x80() {
         %c0 = arith.constant 0 : index
         %cst = arith.constant 0.0 : f32
