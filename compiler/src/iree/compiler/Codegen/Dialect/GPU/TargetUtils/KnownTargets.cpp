@@ -1185,8 +1185,7 @@ std::optional<TargetDetails> getAndroidProfileDetails(StringRef target) {
 constexpr int64_t kLdsBankWidth = 4; // LDS bank width in bytes (AMD)
 
 std::optional<SmallVector<SmallVector<int64_t>>>
-getPhaseGroups(LdsBankPhaseModel model, int64_t readBytes,
-               int64_t numThreads) {
+getPhaseGroups(LdsBankPhaseModel model, int64_t readBytes, int64_t numThreads) {
   if (model == LdsBankPhaseModel::None) {
     return std::nullopt;
   }
@@ -1221,10 +1220,9 @@ getPhaseGroups(LdsBankPhaseModel model, int64_t readBytes,
       // ds_read_b128 on CDNA4: 4 phases of 16 threads, non-contiguous.
       // Phase assignment from hardware documentation / empirical measurement.
       static const int64_t cdna4B128Phases[64] = {
-          0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0,
-          2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2,
-          1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3, 1, 1, 1, 1,
-          3, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3};
+          0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0,
+          0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3,
+          1, 1, 1, 1, 3, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3};
       int64_t numPhases = 4;
       phases.resize(numPhases);
       for (int64_t t = 0; t < numThreads && t < 64; ++t) {

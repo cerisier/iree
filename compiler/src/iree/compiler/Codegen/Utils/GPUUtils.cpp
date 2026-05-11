@@ -903,9 +903,8 @@ bool isXORShuffleValid(int64_t numRowElems, int64_t numAccessElems,
 // For RHS, the N (parallel) dim is rotated to the front so K becomes innermost.
 // This mirrors the convention in GPUTileSwizzleUtils.cpp for TileSwizzle
 // construction.
-static void
-permuteLayoutPerConfig(IREE::GPU::MMASingleSubgroupLayout &layout,
-                       int operandIndex) {
+static void permuteLayoutPerConfig(IREE::GPU::MMASingleSubgroupLayout &layout,
+                                   int operandIndex) {
   bool isLhs = (operandIndex == IREE::GPU::kMMAOperandLhs ||
                 operandIndex == IREE::GPU::kScaledMMAOperandLhs);
   bool isRhs = (operandIndex == IREE::GPU::kMMAOperandRhs ||
@@ -958,8 +957,7 @@ hasNoBankConflicts(const IREE::GPU::MMASingleSubgroupLayout &layout,
     numThreads *= layout.thread[d];
   }
 
-  auto phases =
-      IREE::GPU::getPhaseGroups(phaseModel, readBytes, numThreads);
+  auto phases = IREE::GPU::getPhaseGroups(phaseModel, readBytes, numThreads);
   if (!phases) {
     return failure();
   }
@@ -1022,10 +1020,11 @@ hasNoBankConflicts(const IREE::GPU::MMASingleSubgroupLayout &layout,
 
 // Wrapper that extracts target/intrinsic parameters, permutes the layout
 // to match the physical LDS dimension order, and checks for bank conflicts.
-LogicalResult hasNoBankConflicts(IREE::GPU::TargetAttr target,
-                                IREE::Codegen::InnerTileDescAttrInterface intrinsic,
-                                int operandIndex, bool isTransposed,
-                                function_ref<int64_t(int64_t)> swizzleFn) {
+LogicalResult
+hasNoBankConflicts(IREE::GPU::TargetAttr target,
+                   IREE::Codegen::InnerTileDescAttrInterface intrinsic,
+                   int operandIndex, bool isTransposed,
+                   function_ref<int64_t(int64_t)> swizzleFn) {
   IREE::GPU::MMASingleSubgroupLayout layout =
       IREE::GPU::getSingleSubgroupLayout(intrinsic, operandIndex);
   if (isTransposed) {
@@ -1074,8 +1073,7 @@ makeXorSwizzleFn(int64_t rowElems, int64_t accessElems, int64_t elemBits) {
 FailureOr<XorShuffleParams> getXorShuffleParamsImpl(
     IREE::GPU::TargetAttr target,
     IREE::Codegen::InnerTileDescAttrInterface intrinsic,
-    ArrayRef<int64_t> reductionTileSizes, int operandIndex,
-    bool isTransposed,
+    ArrayRef<int64_t> reductionTileSizes, int operandIndex, bool isTransposed,
     ArrayRef<std::function<LogicalResult(XorShuffleParams)>> constraints) {
   int64_t numAccessElems = getNumAccessElems(intrinsic, operandIndex).value();
 
@@ -1129,7 +1127,7 @@ FailureOr<XorShuffleParams> getXorShuffleParamsImpl(
 
     function_ref<int64_t(int64_t)> swizzleRef = swizzleFn;
     if (succeeded(hasNoBankConflicts(layout, numBanks, elemBits, phaseModel,
-                                    swizzleRef))) {
+                                     swizzleRef))) {
       return candidate;
     }
   }
@@ -1140,8 +1138,9 @@ FailureOr<XorShuffleParams> getXorShuffleParamsImpl(
 /// Returns failure if the target has no DMA support.
 static FailureOr<int64_t> getMinDmaLoadBits(IREE::GPU::TargetAttr target) {
   DenseI64ArrayAttr dmaSizesAttr = target.getWgp().getDmaSizes();
-  if (!dmaSizesAttr || dmaSizesAttr.empty())
+  if (!dmaSizesAttr || dmaSizesAttr.empty()) {
     return failure();
+  }
   return *llvm::min_element(dmaSizesAttr.asArrayRef());
 }
 
@@ -1151,14 +1150,13 @@ static std::function<LogicalResult(XorShuffleParams)>
 makeXorShuffleDmaConstraintFn(
     IREE::GPU::TargetAttr target,
     IREE::Codegen::InnerTileDescAttrInterface intrinsic, int operandIndex) {
-  return [target, intrinsic, operandIndex](
-             XorShuffleParams params) -> LogicalResult {
+  return [target, intrinsic,
+          operandIndex](XorShuffleParams params) -> LogicalResult {
     FailureOr<int64_t> minDmaBits = getMinDmaLoadBits(target);
     if (failed(minDmaBits)) {
       return failure();
     }
-    FailureOr<int64_t> elemBits =
-        getOperandBitwidth(intrinsic, operandIndex);
+    FailureOr<int64_t> elemBits = getOperandBitwidth(intrinsic, operandIndex);
     if (failed(elemBits)) {
       return failure();
     }

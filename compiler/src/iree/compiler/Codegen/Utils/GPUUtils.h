@@ -265,8 +265,7 @@ FailureOr<XorShuffleParams>
 getXorShuffleParams(IREE::GPU::TargetAttr target,
                     IREE::Codegen::InnerTileDescAttrInterface intrinsic,
                     ArrayRef<int64_t> reductionTileSizes, int operandIndex,
-                    bool isTransposed = false,
-                    bool useDirectLoad = false);
+                    bool isTransposed = false, bool useDirectLoad = false);
 
 /// Returns the XOR shuffle attribute for the given target, intrinsic, and
 /// operand index.
@@ -275,8 +274,7 @@ getXorShuffleAttr(MLIRContext *context, Attribute baseConfigAttr,
                   IREE::GPU::TargetAttr target,
                   IREE::Codegen::InnerTileDescAttrInterface intrinsic,
                   ArrayRef<int64_t> reductionTileSizes, int operandIndex,
-                  bool isTransposed = false,
-                  bool useDirectLoad = false);
+                  bool isTransposed = false, bool useDirectLoad = false);
 
 /// Apply inverse XOR swizzle to a sub-tile-local source offset so that the
 /// DMA write-side permutation matches the read-side (ResolveSwizzleHints).

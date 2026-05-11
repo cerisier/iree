@@ -884,16 +884,14 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     // TODO(#24255): Fix untuned swizzle logic for DMA.
     if (lhsElemType.isBF16() && !transposedLhs) {
       FailureOr<Attribute> lhsSwizzleAttr = getXorShuffleAttr(
-          context, lhsAttr, target, kind, schedule->kTileSizes,
-          kMMAOperandLhs);
+          context, lhsAttr, target, kind, schedule->kTileSizes, kMMAOperandLhs);
       if (succeeded(lhsSwizzleAttr)) {
         lhsAttr = *lhsSwizzleAttr;
       }
     }
     if (rhsElemType.isBF16() && transposedRhs) {
       FailureOr<Attribute> rhsSwizzleAttr = getXorShuffleAttr(
-          context, rhsAttr, target, kind, schedule->kTileSizes,
-          kMMAOperandRhs);
+          context, rhsAttr, target, kind, schedule->kTileSizes, kMMAOperandRhs);
       if (succeeded(rhsSwizzleAttr)) {
         rhsAttr = *rhsSwizzleAttr;
       }
