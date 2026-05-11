@@ -530,6 +530,21 @@ Codegen::TileSwizzle getSwizzle(IREE::CPU::DataTiledMMAAttr mma,
       Codegen::expand(swizzle, /*srcIdx=*/0, accOuterIntr);
     }
   }
+  // CPU stores tiles row-major by expandShape group: every dim of group[0]
+  // (outer physical), then every dim of group[1] (inner physical). The
+  // permutation field — bookkept by `Codegen::expand` to track the order
+  // each new dim was inserted — does not reflect this layout (intrinsics_*
+  // expansions on ACC put N-related dims before M-related ones in the
+  // permutation, which doesn't match CPU's row-major intent). Reset it to
+  // identity so the swizzle's permutation actually describes CPU's storage
+  // order; downstream code (`getUndistributedTileTypes`, `sliceSwizzledShape`,
+  // `reshapeToSwizzleDistributed`) can then apply it like GPU does without
+  // a target-specific branch. GPU swizzles keep their non-identity permutation
+  // since on GPU it does describe the actual per-lane storage.
+  auto &permutation = swizzle.permutation();
+  for (size_t i = 0; i < permutation.size(); ++i) {
+    permutation[i] = i;
+  }
   return swizzle;
 }
 
